@@ -1,477 +1,449 @@
-
-## 🧠 Código Python – `trabalho4_mancal_hidrodinamico.py`
-
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.integrate import solve_ivp
 from scipy.optimize import minimize_scalar
-
-# --------------------------------------------------------------------
-# Dados globais (equivalentes ao "global" do MATLAB)
-# --------------------------------------------------------------------
-
-# Vou colocar os parâmetros em um dicionário em vez de usar "global",
-# mas manter os mesmos nomes do seu código para ficar fácil mapear.
+from scipy.integrate import solve_ivp
 
 
+# -------------------------------------------------------------
+# Parâmetros do mancal e rotor  (mesmos do MATLAB)
+# -------------------------------------------------------------
 def build_parameters():
-    params = {}
-
-    # Dados do mancal
     Dm = 0.03       # diâmetro do mancal (m)
-    R = Dm / 2.0    # raio
-    Lm = 0.018      # comprimento (m)
+    R = Dm / 2.0    # raio do mancal (m)
+    Lm = 0.018      # comprimento do mancal (m)
     folga_r = 0.1e-3  # folga radial (m)
-    n_visc = 0.08   # viscosidade (Pa.s)
+    n_visc = 0.08   # viscosidade absoluta (Pa.s)
 
-    # Dados do rotor (eixo + disco)
     De = 0.01       # diâmetro do eixo (m)
     Le = 0.9        # comprimento do eixo (m)
-    Dd = 0.1        # diâmetro do disco (m)
-    r_d = Dd / 2.0
+    Dd = 0.10       # diâmetro do disco (m)
     Ld = 0.02       # comprimento do disco (m)
-    E = 2e11        # módulo de elasticidade (Pa)
-    ro = 7850.0     # densidade (kg/m^3)
-    v = 0.3         # coeficiente de Poisson (não usado diretamente)
-    g = 9.80665     # gravidade (m/s^2)
 
-    Ie = np.pi * De**4 / 64.0        # inércia geométrica eixo
-    k = 48 * E * Ie / (Le**3)        # rigidez equivalente
-    c = 1e-4 * k                     # amortecimento (proporcional)
+    E = 2.0e11      # módulo de elasticidade (Pa)
+    ro = 7850.0     # densidade (kg/m³)
+    v = 0.3         # Poisson (não entra aqui)
+    g = 9.80665     # gravidade (m/s²)
+
+    Ie = np.pi * De**4 / 64.0         # momento de inércia de área do eixo
+    k = 48.0 * E * Ie / (Le**3)       # rigidez do eixo
+    c = 1e-4 * k                      # amortecimento viscoso do eixo
+
     me = (np.pi * De**2 / 4.0) * Le * ro
     md = (np.pi * Dd**2 / 4.0) * Ld * ro
-    e = (1.5e-4) / md                # desbalanceamento (m)
-    Id = 0.5 * md * (Dd / 2.0)**2 + md * e**2  # inércia polar do disco
+    e = 1.5e-4 / md                   # desbalanceamento (m)
 
-    F0 = md * g / 2.0                # carga vertical no mancal
+    Id = 0.5 * md * (Dd / 2.0) ** 2 + md * e**2  # inércia polar do disco
 
-    params.update(dict(
-        Dm=Dm, R=R, Lm=Lm, folga_r=folga_r, n_visc=n_visc,
-        De=De, Le=Le, Dd=Dd, r_d=r_d, Ld=Ld,
-        E=E, ro=ro, v=v, g=g,
-        Ie=Ie, k=k, c=c, me=me, md=md, e=e, Id=Id,
-        F0=F0
-    ))
+    F0 = md * g / 2.0                 # carga no mancal (axial -> reação)
 
-    return params
+    return {
+        "Dm": Dm, "R": R, "Lm": Lm, "folga_r": folga_r, "n_visc": n_visc,
+        "De": De, "Le": Le, "Dd": Dd, "Ld": Ld,
+        "E": E, "ro": ro, "v": v, "g": g,
+        "Ie": Ie, "k": k, "c": c, "me": me, "md": md, "e": e, "Id": Id,
+        "F0": F0
+    }
 
 
-# --------------------------------------------------------------------
-# Relação epsilon(S*) – TODO: colocar a forma correta do seu material
-# --------------------------------------------------------------------
+# -------------------------------------------------------------
+# Sommerfeld modificado S*(ε) – exatamente eq. (15) / epsilon.m
+# S*(ε) = (π/2) * ε / (1-ε²)² * sqrt(1-ε² + (4ε/π)²)
+# -------------------------------------------------------------
+def S_star_from_eps(eps):
+    inside = 1.0 - eps**2 + (4.0 * eps / np.pi) ** 2
+    return (np.pi / 2.0) * (eps / (1.0 - eps**2) ** 2) * np.sqrt(inside)
 
-def epsilon_residual(eps, S):
+
+def eps_from_S_star(S_target, tol=1e-8):
     """
-    Residual da equação que relaciona excentricidade adimensional ε e
-    número de Sommerfeld modificado S* para mancal curto.
-
-    NO SEU MATLAB:
-        eps(i) = fminsearch(@(e)epsilon(e,S(i)), eps(i-1));
-
-    Aqui precisamos da função "epsilon(e,S)" que não veio no anexo.
-    Sem a expressão exata, não dá pra reproduzir fielmente o resultado.
-
-    >>> TODO: Substituir este residual pela equação correta.
-             Por enquanto, uso uma relação monotônica simples
-             apenas pra manter o código executável.
-
-    Exemplo placeholder (não físico):
-        eps_target = 1 - exp(-S)
-        residual = eps - eps_target
+    Resolve S*(ε) = S_target para 0<ε<1 via busca em intervalo.
+    S*(ε) é crescente em (0,1), então dá pra usar busca binária
+    embutida no minimize_scalar com bounds.
     """
-    eps_target = 1.0 - np.exp(-S)
-    return eps - eps_target
+    if S_target <= 0.0:
+        return 0.0
+
+    def obj(e):
+        return abs(S_star_from_eps(e) - S_target)
+
+    res = minimize_scalar(obj, bounds=(1e-6, 0.999999), method="bounded")
+    return float(res.x)
 
 
-def find_eccentricity(S, eps_initial=0.1):
-    """
-    Resolve epsilon_residual(eps, S) ~ 0 via minimização do residual^2,
-    como um análogo do fminsearch do MATLAB.
-    """
-    def obj(eps):
-        return epsilon_residual(eps, S)**2
-
-    res = minimize_scalar(obj, bounds=(1e-4, 0.99), method="bounded")
-    return res.x
-
-
-# --------------------------------------------------------------------
-# Cálculo de gama, beta, k_ij, c_ij (copiado do seu MATLAB)
-# --------------------------------------------------------------------
-
-def compute_bearing_coeffs(omega, params):
-    """
-    Reproduz bloco:
-
-        Fn = (n*Lm^3*R)/(2*folga_r^2)*omega;
-        S0 = ((Lm/(2*R))^2*F0)./Fn;
-        S = F0./Fn;
-        eps = ...
-        alfa = atan((pi/4)*sqrt(1-eps^2)./eps);
-        Ae = 4./(pi^2+(16-pi^2)*eps.^2).^(3/2);
-        gama(:,1:4) = ...
-        beta(:,1:4) = ...
-        kii = gama*(F0/folga_r);
-        cii = beta*(F0/folga_r)./omega;
-
-    omega é um vetor coluna em rad/s.
-    """
-    folga_r = params["folga_r"]
-    Lm = params["Lm"]
+# -------------------------------------------------------------
+# Cálculo de ε(Ω), S*, γik, βik, kik, cik
+# -------------------------------------------------------------
+def compute_bearing_coeffs(params):
     R = params["R"]
+    Lm = params["Lm"]
+    folga_r = params["folga_r"]
     n_visc = params["n_visc"]
     F0 = params["F0"]
 
-    omega = np.asarray(omega).reshape(-1, 1)  # Nx1
+    # mesmo range de frequência da parte de torque no MATLAB (em Hz)
+    omega_Hz = np.arange(0.01, 50.0 + 0.01, 0.01)  # 0.01:0.01:50
+    omega = 2.0 * np.pi * omega_Hz                 # rad/s
 
-    # Força de referência
-    Fn = (n_visc * Lm**3 * R) / (2 * folga_r**2) * omega
-    S0 = ((Lm / (2 * R))**2 * F0) / Fn
-    S = F0 / Fn  # Sommerfeld modificado
+    # para os coeficientes o MATLAB usa um passo mais fino (0.001),
+    # mas para Python isso aqui já é bem próximo e bem mais leve.
+    # Se quiser idêntico, troque para 0.001 aqui e em omega_Hz.
 
-    # Excentricidade vs S
-    eps_list = [0.0]
-    for i in range(1, len(omega) + 1):
-        S_i = S[i - 1, 0]
-        eps_prev = eps_list[-1] if eps_list[-1] > 0 else 0.1
-        eps_i = find_eccentricity(S_i, eps_prev)
-        eps_list.append(eps_i)
+    # Fη (eq. 15): Fη = η L³ R / (2 δ²) * Ω
+    F_eta = (n_visc * Lm**3 * R) / (2.0 * folga_r**2) * omega
 
-    eps = np.array(eps_list[1:]).reshape(-1, 1)  # Nx1
+    # Sommerfelds
+    S0 = ((Lm / (2.0 * R)) ** 2 * F0) / F_eta   # clássico (não usado depois)
+    S_star = F0 / F_eta                         # modificado (eq. 15)
+
+    # ε(S*)
+    eps = np.zeros_like(omega)
+    for i in range(omega.size):
+        eps[i] = eps_from_S_star(S_star[i])
+
+    # Excentricidade dimensional (se quiser comparar com exc do MATLAB)
     exc = eps * folga_r
-    alfa = np.arctan((np.pi / 4.0) * np.sqrt(1 - eps**2) / eps)
 
-    # Fator Ae
-    Ae = 4.0 / (np.pi**2 + (16 - np.pi**2) * eps**2)**(1.5)
+    # α(ε) – eq. (16)
+    alfa = np.arctan((np.pi / 4.0) * (np.sqrt(1.0 - eps**2) / eps))
 
-    # gama(:,1) ... gama(:,4)
-    gama = np.zeros((len(eps), 4))
-    gama[:, 0] = (2 * np.pi**2 + (16 - np.pi**2) * eps[:, 0]**2) * Ae[:, 0]
+    # A(ε) – mesma forma do MATLAB
+    Ae = 4.0 / (np.pi**2 + (16.0 - np.pi**2) * eps**2) ** 1.5
 
-    gama[:, 1] = (np.pi / 4.0) * (
-        np.pi**2
-        - 2 * np.pi**2 * eps[:, 0]**2
-        - (16 - np.pi**2) * eps[:, 0]**4
-    ) / (eps[:, 0] * np.sqrt(1 - eps[:, 0]**2)) * Ae[:, 0]
+    # γik
+    gama11 = (2.0 * np.pi**2 + (16.0 - np.pi**2) * eps**2) * Ae
+    gama12 = (
+        (np.pi / 4.0)
+        * (np.pi**2 - 2.0 * np.pi**2 * eps**2 - (16.0 - np.pi**2) * eps**4)
+        / (eps * np.sqrt(1.0 - eps**2))
+        * Ae
+    )
+    gama21 = -(
+        (np.pi / 4.0)
+        * (np.pi**2 + (32.0 + np.pi**2) * eps**2
+           + (32.0 - 2.0 * np.pi**2) * eps**4)
+        / (eps * np.sqrt(1.0 - eps**2))
+        * Ae
+    )
+    gama22 = (
+        (np.pi**2 + (32.0 + np.pi**2) * eps**2
+         + (32.0 - 2.0 * np.pi**2) * eps**4)
+        / np.sqrt(1.0 - eps**2)
+        * Ae
+    )
+    gama = np.column_stack((gama11, gama12, gama21, gama22))
 
-    gama[:, 2] = -(np.pi / 4.0) * (
-        np.pi**2
-        + (32 + np.pi**2) * eps[:, 0]**2
-        + (32 - 2 * np.pi**2) * eps[:, 0]**4
-    ) / (eps[:, 0] * np.sqrt(1 - eps[:, 0]**2)) * Ae[:, 0]
+    # βik
+    beta11 = (
+        (np.pi / 2.0)
+        * (np.sqrt(1.0 - eps**2) / eps)
+        * (np.pi**2 + (2.0 * np.pi**2 - 16.0) * eps**2)
+        * Ae
+    )
+    beta12 = -(2.0 * np.pi**2 + (4.0 * np.pi**2 - 32.0) * eps**2) * Ae
+    beta21 = beta12.copy()
+    beta22 = (
+        (np.pi / 2.0)
+        * (np.pi**2 + (48.0 - 2.0 * np.pi**2) * eps**2 + np.pi**2 * eps**4)
+        / (eps * np.sqrt(1.0 - eps**2))
+        * Ae
+    )
+    beta = np.column_stack((beta11, beta12, beta21, beta22))
 
-    gama[:, 3] = (
-        np.pi**2
-        + (32 + np.pi**2) * eps[:, 0]**2
-        + (32 - 2 * np.pi**2) * eps[:, 0]**4
-    ) / (np.sqrt(1 - eps[:, 0]**2)) * Ae[:, 0]
+    # Rigidezes e amortecimentos (eq. 17)
+    kii = gama * (F0 / folga_r)                    # N/m
+    cii = beta * (F0 / folga_r) / omega[:, None]   # N·s/m
 
-    # beta(:,1) ... beta(:,4)
-    beta = np.zeros((len(eps), 4))
-    beta[:, 0] = (np.pi / 2.0) * (
-        np.sqrt(1 - eps[:, 0]**2) / eps[:, 0]
-    ) * (np.pi**2 + (2 * np.pi**2 - 16) * eps[:, 0]**2) * Ae[:, 0]
-
-    beta[:, 1] = -(2 * np.pi**2 + (4 * np.pi**2 - 32) * eps[:, 0]**2) * Ae[:, 0]
-    beta[:, 2] = beta[:, 1]
-
-    beta[:, 3] = (np.pi / 2.0) * (
-        np.pi**2
-        + (48 - 2 * np.pi**2) * eps[:, 0]**2
-        + np.pi**2 * eps[:, 0]**4
-    ) / (eps[:, 0] * np.sqrt(1 - eps[:, 0]**2)) * Ae[:, 0]
-
-    # Rigidez e amortecimento (igual ao MATLAB)
-    kii = gama * (F0 / folga_r)              # Nx4
-    cii = beta * (F0 / folga_r) / omega      # Nx4
-
-    return eps[:, 0], exc[:, 0], alfa[:, 0], S[:, 0], kii, cii
+    return omega_Hz, omega, eps, S_star, alfa, gama, beta, kii, cii
 
 
-# --------------------------------------------------------------------
-# Fatores(km,cm) em função da rotação (equivalente a fatores.m)
-# --------------------------------------------------------------------
-
-def fatores(rot, omega_grid, kii, cii):
+# -------------------------------------------------------------
+# Interpolação dos fatores de mancal (equivalente a fatores.m)
+# -------------------------------------------------------------
+def bearing_factors(rot, omega, kii, cii):
     """
-    Interpola km, dm (kii, cii) para uma dada rotação "rot" (rad/s),
-    equivalente a:
-
-        Kii = interp1(omega,kii,rot,'linear','extrap');
-        dii = interp1(omega,cii,rot,'linear','extrap');
-
-    Retorna vetores 4-elemento km, dm.
+    rot: velocidade angular instantânea (rad/s)
+    omega: vetor (rad/s) usado para tabular kii/cii
+    retorna K11..K22, C11..C22
     """
-    km = np.array([
-        np.interp(rot, omega_grid, kii[:, j]) for j in range(4)
-    ])
-    dm = np.array([
-        np.interp(rot, omega_grid, cii[:, j]) for j in range(4)
-    ])
-    return km, dm
+    K = np.array([np.interp(rot, omega, kii[:, j]) for j in range(4)])
+    C = np.array([np.interp(rot, omega, cii[:, j]) for j in range(4)])
+    return K, C
 
 
-# --------------------------------------------------------------------
-# Equação diferencial – laval_mancal (caso com torque T1)
-# --------------------------------------------------------------------
-
-def laval_mancal(t, y, params, omega_grid, kii, cii, T1):
-    """
-    Equivalente à função laval_mancal(t,y) do MATLAB.
-
-    Estados:
-        y = [theta, y, z, theta_dot, y_dot, z_dot, y_m, z_m]
-
-    """
+# -------------------------------------------------------------
+# ODE – laval_mancal (caso com torque T1, igual ao MATLAB)
+# -------------------------------------------------------------
+def laval_mancal_rhs(t, y, params, omega, kii, cii, T1):
     Id = params["Id"]
     md = params["md"]
     c = params["c"]
     k = params["k"]
     e = params["e"]
 
-    theta, y_d, z_d, theta_dot, y_dot, z_dot, y_m, z_m = y
+    # estados: y = [theta, uy, uz, theta_dot, uy_dot, uz_dot, ym, zm]
+    theta, uy, uz, theta_dot, uy_dot, uz_dot, ym, zm = y
 
-    # Fatores do mancal
-    km, dm = fatores(theta_dot, omega_grid, kii, cii)
+    # coeficientes do mancal para a rotação atual
+    km, dm = bearing_factors(theta_dot, omega, kii, cii)
     K11, K12, K21, K22 = km
     C11, C12, C21, C22 = dm
 
-    D1 = k / 2.0 * (y_d - y_m) - (K11 * y_m + K12 * z_m)
-    D2 = k / 2.0 * (z_d - z_m) - (K21 * y_m + K22 * z_m)
+    # D1, D2 e B (mesma álgebra do MATLAB)
+    D1 = k / 2.0 * (uy - ym) - (K11 * ym + K12 * zm)
+    D2 = k / 2.0 * (uz - zm) - (K21 * ym + K22 * zm)
     B = (D2 - D1 * C21 / C11) / (C22 - C21 * C12 / C11)
 
+    # equação angular
     A1 = (1.0 / Id) * (
         T1
-        + k * (z_d - z_m) * (e * np.cos(theta))
-        - k * (y_d - y_m) * (e * np.sin(theta))
-        - c * y_dot * (e * np.sin(theta))
-        + c * z_dot * (e * np.cos(theta))
+        + k * (uz - zm) * (e * np.cos(theta))
+        - k * (uy - ym) * (e * np.sin(theta))
+        - c * uy_dot * (e * np.sin(theta))
+        + c * uz_dot * (e * np.cos(theta))
     )
 
     dydt = np.zeros_like(y)
-    dydt[0] = theta_dot                       # theta_dot
-    dydt[1] = y_dot                           # y_dot
-    dydt[2] = z_dot                           # z_dot
-    dydt[3] = A1                              # theta_ddot
-
-    dydt[4] = (1.0 / md) * (
-        md * e * (dydt[3] * np.sin(theta) + theta_dot**2 * np.cos(theta))
-        - c * y_dot
-        - k * (y_d - y_m)
+    dydt[0] = theta_dot
+    dydt[1] = uy_dot
+    dydt[2] = uz_dot
+    dydt[3] = A1
+    dydt[4] = (
+        1.0 / md * (
+            md * e * (dydt[3] * np.sin(theta) + theta_dot**2 * np.cos(theta))
+            - c * uy_dot
+            - k * (uy - ym)
+        )
     )
-
-    dydt[5] = (1.0 / md) * (
-        md * e * (-dydt[3] * np.cos(theta) + theta_dot**2 * np.sin(theta))
-        - c * z_dot
-        - k * (z_d - z_m)
+    dydt[5] = (
+        1.0 / md * (
+            md * e * (-dydt[3] * np.cos(theta) + theta_dot**2 * np.sin(theta))
+            - c * uz_dot
+            - k * (uz - zm)
+        )
     )
-
-    dydt[6] = D1 / C11 - C12 / C11 * B        # y_m_dot
-    dydt[7] = B                               # z_m_dot
-
+    dydt[6] = D1 / C11 - C12 / C11 * B
+    dydt[7] = B
     return dydt
 
 
-# --------------------------------------------------------------------
-# Equação diferencial – laval_mancalwcons (rotação constante)
-# --------------------------------------------------------------------
-
-def laval_mancalwcons(t, y, params, km, cm, w):
-    """
-    Equivalente a laval_mancalwcons(t,y) do MATLAB.
-
-    Estados:
-        y = [y, z, y_dot, z_dot, y_m, z_m]
-    """
+# -------------------------------------------------------------
+# ODE – laval_mancalwcons (Ω constante)
+# -------------------------------------------------------------
+def laval_mancal_const_rhs(t, y, params, w, km, cm):
     md = params["md"]
     c = params["c"]
     k = params["k"]
     e = params["e"]
 
-    y_d, z_d, y_dot, z_dot, y_m, z_m = y
+    # estados: y = [uy, uz, uy_dot, uz_dot, ym, zm]
+    uy, uz, uy_dot, uz_dot, ym, zm = y
 
     K11, K12, K21, K22 = km
     C11, C12, C21, C22 = cm
 
-    D1 = k / 2.0 * (y_d - y_m) - (K11 * y_m + K12 * z_m)
-    D2 = k / 2.0 * (z_d - z_m) - (K21 * y_m + K22 * z_m)
+    D1 = k / 2.0 * (uy - ym) - (K11 * ym + K12 * zm)
+    D2 = k / 2.0 * (uz - zm) - (K21 * ym + K22 * zm)
     B = (D2 - D1 * C21 / C11) / (C22 - C21 * C12 / C11)
 
     dydt = np.zeros_like(y)
-    dydt[0] = y_dot
-    dydt[1] = z_dot
-
+    dydt[0] = uy_dot
+    dydt[1] = uz_dot
     dydt[2] = (1.0 / md) * (
-        md * e * w**2 * np.cos(w * t)
-        - c * y_dot
-        - k * (y_d - y_m)
+        md * e * w**2 * np.cos(w * t) - c * uy_dot - k * (uy - ym)
     )
-
     dydt[3] = (1.0 / md) * (
-        md * e * w**2 * np.sin(w * t)
-        - c * z_dot
-        - k * (z_d - z_m)
+        md * e * w**2 * np.sin(w * t) - c * uz_dot - k * (uz - zm)
     )
-
-    dydt[4] = D1 / C11 - C12 / C11 * B   # y_m_dot
-    dydt[5] = B                          # z_m_dot
-
+    dydt[4] = D1 / C11 - C12 / C11 * B
+    dydt[5] = B
     return dydt
 
 
-# --------------------------------------------------------------------
-# Função principal – espelha o fluxo do script MATLAB
-# --------------------------------------------------------------------
-
-def main():
-    params = build_parameters()
-
-    # Malha de velocidades (igual ao MATLAB)
-    omega_Hz = np.arange(0.01, 50.01, 0.01)
-    omega = 2.0 * np.pi * np.arange(0.01, 50.001, 0.001)  # rad/s
-
-    # Cálculo dos coeficientes do mancal
-    eps, exc, alfa, S, kii, cii = compute_bearing_coeffs(omega, params)
-
-    # ---------------------------
-    # Caso 1, 2, 3 – torque T1
-    # ---------------------------
-    t1 = 50.0
-    y0_case1 = np.array([0, 0, 0, 0.1, 0, 0, 0, 0], dtype=float)
-    y0_case2 = np.array([0, 0, 0, 0.01, 0, 0, 0, 0], dtype=float)
-    y0_case3 = np.array([0, 0, 0, 0.01, 0, 0, 0, 0], dtype=float)
-
-    t_eval1 = np.linspace(0.0, t1, 5000)
-
-    # T1 = 0.01
-    sol1 = solve_ivp(
-        lambda t, y: laval_mancal(t, y, params, omega, kii, cii, T1=0.01),
-        (0.0, t1),
-        y0_case1,
-        t_eval=t_eval1,
-        rtol=1e-6,
-        atol=1e-9
-    )
-
-    # T1 = 0.0045
-    sol2 = solve_ivp(
-        lambda t, y: laval_mancal(t, y, params, omega, kii, cii, T1=0.0045),
-        (0.0, t1),
-        y0_case2,
-        t_eval=t_eval1,
-        rtol=1e-6,
-        atol=1e-9
-    )
-
-    # T1 = 0.004
-    sol3 = solve_ivp(
-        lambda t, y: laval_mancal(t, y, params, omega, kii, cii, T1=0.004),
-        (0.0, t1),
-        y0_case3,
-        t_eval=t_eval1,
-        rtol=1e-6,
-        atol=1e-9
-    )
-
-    # ----------------------------------------------------
-    # Casos com rotação constante (w = 30, 50, 72, 120, 150, 145)
-    # ----------------------------------------------------
-    t1_const = 100.0
-    t_eval_const = np.linspace(0.0, t1_const, 5000)
-
-    w_list = [30.0, 50.0, 72.0, 120.0, 150.0, 145.0]  # rad/s (no MATLAB w=30, 50, 72, 120, 150, 145)
-    orbits = {}
-
-    for w in w_list:
-        km = np.array([np.interp(w, omega, kii[:, j]) for j in range(4)])
-        cm = np.array([np.interp(w, omega, cii[:, j]) for j in range(4)])
-
-        y0_const = np.zeros(6, dtype=float)
-        sol_const = solve_ivp(
-            lambda t, y: laval_mancalwcons(t, y, params, km, cm, w),
-            (0.0, t1_const),
-            y0_const,
-            t_eval=t_eval_const,
-            rtol=1e-6,
-            atol=1e-9
-        )
-
-        orbits[w] = sol_const
-
-    # ---------------------------
-    # Gráficos principais
-    # ---------------------------
-
-    # Excentricidade vs velocidade angular (em Hz)
+# -------------------------------------------------------------
+# Plots estáticos (ε, S*, α, γik, βik, kik, cik)
+# -------------------------------------------------------------
+def plot_static_results(omega_Hz, omega, eps, S_star, alfa, gama, beta, kii, cii):
+    # ε x Ω
     plt.figure()
+    plt.plot(omega_Hz, eps, linewidth=1.5)
     plt.grid(True)
+    plt.xlim(0.0, 50.0)
+    plt.ylim(0.0, 1.0)
+    plt.xlabel("Velocidade angular Ω (Hz)")
+    plt.ylabel("Excentricidade ε")
     plt.title("Excentricidade em função da velocidade angular")
-    plt.xlabel(r"Velocidade angular $\Omega$ (Hz)")
-    plt.ylabel(r"Excentricidade $\epsilon$")
-    plt.plot(omega / (2.0 * np.pi), eps, linewidth=1.5)
-    plt.xlim(0, 50)
-    plt.ylim(0, 1)
 
-    # S* e alfa vs epsilon
-    plt.figure()
-    plt.title(r"S* e ângulo $\alpha$ em função da excentricidade $\epsilon$")
-    plt.xlabel(r"Excentricidade $\epsilon$")
-    plt.grid(True)
-
-    ax1 = plt.gca()
-    ax1.set_ylabel(r"Número de Sommerfeld modificado $S^*$")
-    ax1.semilogy(eps, S, linewidth=1.5)
+    # S* e α x ε
+    fig, ax1 = plt.subplots()
+    ax1.semilogy(eps, S_star, "b", linewidth=1.5, label="S*")
+    ax1.set_xlabel("Excentricidade ε")
+    ax1.set_ylabel("S*", color="b")
+    ax1.grid(True)
+    ax1.set_xlim(0.0, 1.0)
     ax1.set_ylim(1e-2, 1e2)
 
     ax2 = ax1.twinx()
-    ax2.set_ylabel(r"Ângulo $\alpha$ (graus)")
-    ax2.plot(eps, alfa * 180.0 / np.pi, linewidth=1.5)
-    ax2.set_ylim(0, 90)
+    ax2.plot(eps, np.degrees(alfa), "r", linewidth=1.5, label="α")
+    ax2.set_ylabel("Ângulo α (graus)", color="r")
+    ax2.set_ylim(0.0, 90.0)
 
-    # Fatores gama
+    fig.suptitle("S* e ângulo α em função da excentricidade ε")
+
+    # γik x ε
     plt.figure()
-    plt.semilogy(eps, kii[:, 0] * 0 + (np.abs(kii[:, 0]) / (params["F0"] / params["folga_r"])))  # só pra ilustrar
-    plt.title(r"Fatores $\gamma_{ik}$ e $\beta_{ik}$ – ver código para detalhes")
+    labels_g = ["γ11", "γ12", "-γ21", "γ22"]
+    series_g = [gama[:, 0], gama[:, 1], -gama[:, 2], gama[:, 3]]
+    for s, lab in zip(series_g, labels_g):
+        plt.semilogy(eps, s, linewidth=1.5, label=lab)
     plt.grid(True)
+    plt.xlim(0.0, 1.0)
+    plt.ylim(10**-4, 10**2)
+    plt.xlabel("Excentricidade ε")
+    plt.ylabel("γik")
+    plt.title("Fatores γik em função da excentricidade ε")
+    plt.legend()
 
-    # Resposta temporal – exemplo para Caso 1 (Uy, Uz, rotação)
-    t = sol1.t
-    y1 = sol1.y
-    theta1 = y1[0, :]
-    uy1 = y1[1, :]
-    uz1 = y1[2, :]
-    theta_dot1 = y1[3, :]
+    # βik x ε
+    plt.figure()
+    labels_b = ["β11", "-β12", "-β21", "β22"]
+    series_b = [beta[:, 0], -beta[:, 1], -beta[:, 2], beta[:, 3]]
+    for s, lab in zip(series_b, labels_b):
+        plt.semilogy(eps, s, linewidth=1.5, label=lab)
+    plt.grid(True)
+    plt.xlim(0.0, 1.0)
+    plt.ylim(10**-0.5, 10**2)
+    plt.xlabel("Excentricidade ε")
+    plt.ylabel("βik")
+    plt.title("Fatores βik em função da excentricidade ε")
+    plt.legend()
 
-    fig, axs = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
-    fig.suptitle("Caso 1 – Rotação e deslocamentos Uy, Uz")
+    # k_ik x Ω (usei Ω em Hz no eixo, fica mais “físico” que o MATLAB)
+    plt.figure()
+    for j, lab in enumerate(["k11", "k12", "k21", "k22"]):
+        plt.plot(omega_Hz, kii[:, j], linewidth=1.5, label=lab)
+    plt.grid(True)
+    plt.xlim(0.0, 50.0)
+    plt.ylim(-1e6, 1e6)
+    plt.xlabel("Velocidade angular Ω (Hz)")
+    plt.ylabel("kik (N/m)")
+    plt.title("Rigidezes kik em função da velocidade angular Ω")
+    plt.legend()
 
-    axs[0].plot(t, 1000.0 * uy1, label="Uy (mm)")
-    axs[0].plot(t, 1000.0 * uz1, label="Uz (mm)")
-    axs[0].set_ylabel("Deslocamento (mm)")
-    axs[0].grid(True)
-    axs[0].legend()
+    # c_ik x Ω
+    plt.figure()
+    for j, lab in enumerate(["c11", "c12", "c21", "c22"]):
+        plt.plot(omega_Hz, cii[:, j], linewidth=1.5, label=lab)
+    plt.grid(True)
+    plt.xlim(0.0, 50.0)
+    plt.ylim(-5e5, 1.5e6)
+    plt.xlabel("Velocidade angular Ω (Hz)")
+    plt.ylabel("cik (N·s/m)")
+    plt.title("Amortecimentos cik em função da velocidade angular Ω")
+    plt.legend()
 
-    axs[1].plot(t, theta_dot1, label=r"$\dot{\theta}$ (rad/s)")
-    axs[1].set_xlabel("Tempo (s)")
-    axs[1].set_ylabel("Rotação (rad/s)")
-    axs[1].grid(True)
-    axs[1].legend()
 
-    # Órbita para uma rotação constante (por exemplo w=150 rad/s)
-    w_example = 150.0
-    if w_example in orbits:
-        sol_w = orbits[w_example]
-        y_w = sol_w.y
-        y_d = y_w[0, :]
-        z_d = y_w[1, :]
+# -------------------------------------------------------------
+# Simulações de torque (3 casos) e órbitas a Ω constante
+# -------------------------------------------------------------
+def simulate_torque_cases(params, omega, kii, cii):
+    # mesmos T1 e t1 do MATLAB
+    t_end = 50.0
+    T_list = [0.01, 0.0045, 0.004]
+    theta0_list = [0.1, 0.01, 0.01]
+
+    res = []
+    for T1, th0 in zip(T_list, theta0_list):
+        y0 = np.array([0.0, 0.0, 0.0, th0, 0.0, 0.0, 0.0, 0.0])
+        sol = solve_ivp(
+            lambda t, y: laval_mancal_rhs(t, y, params, omega, kii, cii, T1),
+            (0.0, t_end),
+            y0,
+            method="RK45",
+            max_step=0.05,
+            rtol=1e-6,
+            atol=1e-9,
+        )
+        res.append((T1, sol.t, sol.y))
+
+    # plot simples: velocidade angular x tempo
+    plt.figure()
+    for T1, t, y in res:
+        plt.plot(t, y[3, :], label=f"T1 = {T1:.4f} N·m")
+    plt.xlabel("Tempo (s)")
+    plt.ylabel("Velocidade angular θ̇ (rad/s)")
+    plt.title("Passagem pela 1ª velocidade crítica – diferentes torques")
+    plt.grid(True)
+    plt.legend()
+
+    # deslocamentos em y para cada caso
+    plt.figure()
+    for T1, t, y in res:
+        plt.plot(t, 1000.0 * y[1, :], label=f"T1 = {T1:.4f} N·m")
+    plt.xlabel("Tempo (s)")
+    plt.ylabel("Deslocamento uy (mm)")
+    plt.title("Deslocamento radial uy para diferentes torques")
+    plt.grid(True)
+    plt.legend()
+
+
+def simulate_constant_speed_orbits(params, omega, kii, cii):
+    # mesmos w do MATLAB: 30, 50, 72, 120, 150 rad/s
+    w_list = [30.0, 50.0, 72.0, 120.0, 150.0]
+    t_end = 100.0
+
+    for w in w_list:
+        # pega km, cm fixos para essa rotação
+        km = np.array([np.interp(w, omega, kii[:, j]) for j in range(4)])
+        cm = np.array([np.interp(w, omega, cii[:, j]) for j in range(4)])
+
+        u0 = np.zeros(6)  # [uy, uz, uy_dot, uz_dot, ym, zm]
+        sol = solve_ivp(
+            lambda t, u: laval_mancal_const_rhs(t, u, params, w, km, cm),
+            (0.0, t_end),
+            u0,
+            method="RK45",
+            max_step=0.05,
+            rtol=1e-6,
+            atol=1e-9,
+        )
+
+        t = sol.t
+        uy = sol.y[0, :]
+        uz = sol.y[1, :]
+
+        # ==== FILTRO DE TRANSIENTE ====
+        T = 2.0 * np.pi / w          # período da rotação
+        Nper = 5                     # quantos períodos finais queremos
+        t_min = t_end - Nper * T     # começo da janela em regime
+
+        mask = t >= t_min            # pega só o final
+        uy_ss = uy[mask]
+        uz_ss = uz[mask]
+        # ==============================
 
         plt.figure()
-        plt.plot(1000.0 * y_d, 1000.0 * z_d)
-        plt.xlabel("Uy (mm)")
-        plt.ylabel("Uz (mm)")
-        plt.title(f"Órbita do rotor – w = {w_example:.1f} rad/s")
-        plt.grid(True)
+        plt.plot(1000.0 * uy_ss, 1000.0 * uz_ss, linewidth=1.5)
+        plt.xlabel("uy (mm)")
+        plt.ylabel("uz (mm)")
+        plt.title(f"Órbita no plano y–z (Ω = {w:.0f} rad/s)")
         plt.axis("equal")
+        plt.grid(True)
+
+# -------------------------------------------------------------
+# main
+# -------------------------------------------------------------
+def main():
+    params = build_parameters()
+    omega_Hz, omega, eps, S_star, alfa, gama, beta, kii, cii = compute_bearing_coeffs(params)
+
+    # parte estática
+    plot_static_results(omega_Hz, omega, eps, S_star, alfa, gama, beta, kii, cii)
+
+    # resposta temporal com torque (3 casos)
+    simulate_torque_cases(params, omega, kii, cii)
+
+    # órbitas para velocidades constantes
+    simulate_constant_speed_orbits(params, omega, kii, cii)
 
     plt.show()
 
