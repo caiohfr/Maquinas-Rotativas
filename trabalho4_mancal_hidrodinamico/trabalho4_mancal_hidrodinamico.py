@@ -89,7 +89,7 @@ def compute_bearing_coeffs(params):
     # Se quiser idêntico, troque para 0.001 aqui e em omega_Hz.
 
     # Fη (eq. 15): Fη = η L³ R / (2 δ²) * Ω
-    F_eta = (n_visc * Lm**3 * R) / (2.0 * folga_r**2) * omega
+    F_eta = (n_visc * Lm**3 * R) / (2.0 * folga_r**2) * omega_Hz
 
     # Sommerfelds
     S0 = ((Lm / (2.0 * R)) ** 2 * F0) / F_eta   # clássico (não usado depois)
